@@ -714,3 +714,7 @@ func (l *Log) DataOffset(index uint64) (int64, error) {
 	defer l.mu.Unlock()
 	return l.locateDataOffsetLocked(index)
 }
+
+func (l *Log) ReadAt(p []byte, off int64) (int, error) {
+	return l.fp.ReadAt(p, off)
+}
