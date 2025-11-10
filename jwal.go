@@ -708,3 +708,9 @@ func (it *Iter) NextInto(dst []byte) ([]byte, uint64, error) {
 
 	return out, curIdx, nil
 }
+
+func (l *Log) DataOffset(index uint64) (int64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.locateDataOffsetLocked(index)
+}
