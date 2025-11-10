@@ -23,6 +23,7 @@ func (l *Log) Iter(from uint64) (*Iter, error) {
 	if from > l.count.Load() {
 		return nil, io.EOF
 	}
+
 	var hdrOff int64
 	if from == 1 {
 		hdrOff = dataBase
