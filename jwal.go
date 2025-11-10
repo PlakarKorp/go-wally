@@ -35,13 +35,15 @@ type Options struct {
 	//   0 => defaults to 4096 (sparse)
 
 	// Compression: "none" (default) or "snappy"
-	Compression string
+	Compression   string
+	DeleteOnClose bool
 }
 
 type Log struct {
-	mu sync.Mutex
-	fp *os.File
-	w  *bufio.Writer
+	mu   sync.Mutex
+	fp   *os.File
+	w    *bufio.Writer
+	path string
 
 	hdr [headerSize]byte
 	idx []int64
@@ -50,6 +52,7 @@ type Log struct {
 	noSync             bool
 	retainIndex        bool
 	checkpointInterval uint
+	deleteOnClose      bool
 	codec              uint32 // codecNone or codecSnappy
 
 	// counters
@@ -87,10 +90,12 @@ func Open(path string, opts *Options) (*Log, error) {
 
 	l := &Log{
 		fp:                 fp,
+		path:               path,
 		w:                  bufio.NewWriterSize(fp, bufsz),
 		noSync:             opts.NoSync,
 		retainIndex:        opts.RetainIndex,
 		checkpointInterval: opts.CheckpointInterval,
+		deleteOnClose:      opts.DeleteOnClose,
 		codec:              codec,
 	}
 	if l.retainIndex {
@@ -526,6 +531,12 @@ func (l *Log) Close() error {
 		_ = l.fp.Close()
 		return err
 	}
+
+	if l.deleteOnClose {
+		_ = l.fp.Close()
+		return os.Remove(l.path)
+	}
+
 	return l.fp.Close()
 }
 
