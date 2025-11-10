@@ -25,7 +25,7 @@ func (l *Log) Iter(from uint64) (*Iter, error) {
 	}
 	var hdrOff int64
 	if from == 1 {
-		hdrOff = 0
+		hdrOff = dataBase
 	} else {
 		dataOff, err := l.locateDataOffsetLocked(from)
 		if err != nil {
