@@ -423,9 +423,13 @@ func (l *Log) ReadInto(index uint64, dst []byte) ([]byte, error) {
 		// snappy.Decode requires a new buffer; we can allocate exact size if ulen>0
 		if ulen > 0 && int(ulen) <= cap(dst) {
 			dst = dst[:int(ulen)]
-			out, err := snappy.Decode(dst[:0], tmp) // will reuse provide dst backing
+			out, err := snappy.Decode(dst[:0], tmp) // reuse dst backing
 			if err != nil {
 				return nil, err
+			}
+			// Sanity-check uncompressed length even on reuse path.
+			if ulen != 0 && uint32(len(out)) != ulen {
+				return nil, io.ErrUnexpectedEOF
 			}
 			return out, nil
 		}
@@ -795,9 +799,13 @@ func (it *Iter) NextInto(dst []byte) ([]byte, uint64, error) {
 		if ulen > 0 && int(ulen) <= cap(dst) {
 			dst = dst[:int(ulen)]
 			var err error
-			out, err = snappy.Decode(dst[:0], tmp)
+			out, err = snappy.Decode(dst[:0], tmp) // reuse dst backing
 			if err != nil {
 				return nil, 0, err
+			}
+			// Sanity-check uncompressed length on reuse path too.
+			if ulen != 0 && uint32(len(out)) != ulen {
+				return nil, 0, io.ErrUnexpectedEOF
 			}
 		} else {
 			var err error
@@ -809,6 +817,7 @@ func (it *Iter) NextInto(dst []byte) ([]byte, uint64, error) {
 				return nil, 0, io.ErrUnexpectedEOF
 			}
 		}
+
 	default:
 		return nil, 0, io.ErrUnexpectedEOF
 	}

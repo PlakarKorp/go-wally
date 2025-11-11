@@ -1889,3 +1889,969 @@ func BenchmarkReadParallel_SparseIndex_ReadInto(b *testing.B) {
 	})
 	b.StopTimer()
 }
+
+func TestBatch_RecordsAccessor(t *testing.T) {
+	var b Batch
+	a := []byte("a")
+	bb := []byte("bb")
+	b.Add(a)
+	b.Add(bb)
+	recs := b.Records()
+	if len(recs) != 2 || !bytes.Equal(recs[0], a) || !bytes.Equal(recs[1], bb) {
+		t.Fatalf("Records() mismatch")
+	}
+}
+
+func TestOpen_InvalidCompressionOption(t *testing.T) {
+	p := tmpPath(t)
+	_, err := Open(p, &Options{Compression: "bogus-codec"})
+	if err == nil {
+		t.Fatalf("expected error on invalid compression option")
+	}
+}
+
+func TestOpen_RetainIndex_DefaultK(t *testing.T) {
+	// RetainIndex=true and k=0 => defaults to 4096
+	p := tmpPath(t)
+	l, err := Open(p, &Options{
+		RetainIndex:        true,
+		CheckpointInterval: 0,
+		Compression:        "none",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+	// Indirectly confirm by forcing a read that would scan from the nearest checkpoint.
+	// With just a few records, behavior is identical, but at least we cover the branch.
+	if _, err := l.Append([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Read(1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---- ReadInto branches (comp=none) ----
+
+func TestReadInto_None_DstTooSmall(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none"})
+	defer l.Close()
+
+	msg := bytes.Repeat([]byte{7}, 1024)
+	if _, err := l.Append(msg); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := make([]byte, 0, 16) // cap < len(msg) forces allocate path
+	out, err := l.ReadInto(1, dst[:0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != len(msg) || !bytes.Equal(out, msg) {
+		t.Fatalf("content mismatch")
+	}
+}
+
+func TestReadInto_None_DstBigEnough(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none"})
+	defer l.Close()
+
+	msg := bytes.Repeat([]byte{9}, 256)
+	if _, err := l.Append(msg); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := make([]byte, 0, len(msg)) // cap >= len(msg) → copy into dst branch
+	out, err := l.ReadInto(1, dst[:0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != len(msg) || !bytes.Equal(out, msg) {
+		t.Fatalf("content mismatch")
+	}
+}
+
+// ---- ReadInto & Iter.NextInto for snappy: reuse vs non-reuse ----
+
+func TestReadInto_Snappy_DstSmall_ForceNonReuse(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy"})
+	defer l.Close()
+
+	orig := bytes.Repeat([]byte{1, 2, 3, 4}, 8<<10) // 32 KiB
+	if _, err := l.Append(orig); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capacity smaller than ulen -> else branch (Decode into new buffer)
+	dst := make([]byte, 0, len(orig)/4)
+	out, err := l.ReadInto(1, dst[:0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != len(orig) || !bytes.Equal(out, orig) {
+		t.Fatalf("mismatch")
+	}
+}
+
+func TestIter_NextInto_Snappy_ReuseAndNonReuse(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy"})
+	defer l.Close()
+
+	recs := [][]byte{
+		bytes.Repeat([]byte{0xAA}, 4096),
+		bytes.Repeat([]byte{0xBB}, 8192),
+	}
+	if _, _, err := l.AppendBatch(recs...); err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First: dst big enough → reuse path
+	dst := make([]byte, 0, len(recs[0])+128)
+	out, idx, err := it.NextInto(dst[:0])
+	if err != nil || idx != 1 || !bytes.Equal(out, recs[0]) {
+		t.Fatalf("first mismatch: idx=%d err=%v", idx, err)
+	}
+
+	// Second: dst too small → non-reuse path
+	dst = make([]byte, 0, 16)
+	out, idx, err = it.NextInto(dst[:0])
+	if err != nil || idx != 2 || !bytes.Equal(out, recs[1]) {
+		t.Fatalf("second mismatch: idx=%d err=%v", idx, err)
+	}
+}
+
+// 1) Force snappy ulen mismatch → Read/ReadInto should return io.ErrUnexpectedEOF.
+func TestRead_Snappy_UlenMismatch(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	orig := bytes.Repeat([]byte{0xCC}, 8<<10) // 8 KiB
+	if _, err := l.Append(orig); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	off, err := l.DataOffset(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flip the uncompressedLen field in the header at (off-recordHdrSize)+[12..16].
+	f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	hdr := make([]byte, recordHdrSize)
+	if _, err := f.ReadAt(hdr, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	ulen := binary.LittleEndian.Uint32(hdr[12:16])
+	binary.LittleEndian.PutUint32(hdr[12:16], ulen+123) // wrong ulen → should trigger mismatch
+	if _, err := f.WriteAt(hdr, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now Read / ReadInto should fail with ErrUnexpectedEOF after decoding.
+	if _, err := l.Read(1); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("Read: want ErrUnexpectedEOF, got %v", err)
+	}
+	if _, err := l.ReadInto(1, nil); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ReadInto: want ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+// 2) Iter(from > LastIndex) should error immediately from constructor.
+func TestIter_FromBeyondEnd(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none"})
+	defer l.Close()
+
+	if _, err := l.Append([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Iter(2); !errors.Is(err, io.EOF) {
+		t.Fatalf("Iter(from>LastIndex) want EOF, got %v", err)
+	}
+}
+
+// 3) NextInto with comp=none: both dst-capacity branches (cap < n and cap >= n).
+func TestNextInto_None_CapacityBranches(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none", retain: true, checkptK: 1})
+	defer l.Close()
+
+	recs := [][]byte{
+		bytes.Repeat([]byte{1}, 128),
+		bytes.Repeat([]byte{2}, 128),
+	}
+	if _, _, err := l.AppendBatch(recs...); err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First: dst too small → allocate path inside NextInto(compNone).
+	dst := make([]byte, 0, 16)
+	out, idx, err := it.NextInto(dst[:0])
+	if err != nil || idx != 1 || len(out) != len(recs[0]) || !bytes.Equal(out, recs[0]) {
+		t.Fatalf("first mismatch: idx=%d err=%v len=%d", idx, err, len(out))
+	}
+
+	// Second: dst big enough → copy-into-dst branch.
+	dst = make([]byte, 0, len(recs[1]))
+	out, idx, err = it.NextInto(dst[:0])
+	if err != nil || idx != 2 || len(out) != len(recs[1]) || !bytes.Equal(out, recs[1]) {
+		t.Fatalf("second mismatch: idx=%d err=%v len=%d", idx, err, len(out))
+	}
+}
+
+func TestOpen_ShortFile_LessThanHeader(t *testing.T) {
+	p := tmpPath(t)
+
+	// Create a file shorter than the WAL header (16 bytes).
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	} // 8 < walHdrSize
+	_ = f.Close()
+
+	l, err := Open(p, &Options{Compression: "none"})
+	if err != nil {
+		t.Fatalf("Open(short): %v", err)
+	}
+	defer l.Close()
+
+	// We should have a valid empty WAL now.
+	if got := l.LastIndex(); got != 0 {
+		t.Fatalf("LastIndex=%d want 0", got)
+	}
+	// File should at least contain the WAL header now.
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() < walHdrSize {
+		t.Fatalf("file size=%d, want >= %d", fi.Size(), walHdrSize)
+	}
+}
+
+func TestOpen_Reopen_UsesHeaderCodec(t *testing.T) {
+	p := tmpPath(t)
+
+	// Write with snappy.
+	l1 := mustOpen(t, p, openOpt{comp: "snappy"})
+	in := bytes.Repeat([]byte{0x5A}, 16<<10)
+	if _, err := l1.Append(in); err != nil {
+		t.Fatal(err)
+	}
+	_ = l1.Close()
+
+	// Reopen with "none" in options — should still decode snappy because header says snappy.
+	l2 := mustOpen(t, p, openOpt{comp: "none"})
+	defer l2.Close()
+
+	out, err := l2.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, in) {
+		t.Fatalf("reopen/header-codec mismatch")
+	}
+}
+
+func TestTruncateBack_OutOfRange(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none"})
+	defer l.Close()
+
+	// 1 record
+	if _, err := l.Append([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Truncate beyond end should be EOF
+	if err := l.TruncateBack(2); !errors.Is(err, io.EOF) {
+		t.Fatalf("TruncateBack: want EOF, got %v", err)
+	}
+}
+
+func TestRead_NoIndex_LinearScan(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none", retain: false}) // no index
+	defer l.Close()
+
+	recs := [][]byte{
+		[]byte("aa"),
+		[]byte("bbb"),
+		[]byte("cccc"),
+	}
+	if _, _, err := l.AppendBatch(recs...); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reading #3 must walk two headers first.
+	out, err := l.Read(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, recs[2]) {
+		t.Fatalf("linear-scan read mismatch")
+	}
+}
+
+// NextInto: CRC mismatch should return io.ErrUnexpectedEOF.
+func TestIter_NextInto_Snappy_CRCMismatch(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	recs := [][]byte{
+		bytes.Repeat([]byte{0x11}, 2048),
+		bytes.Repeat([]byte{0x22}, 2048),
+	}
+	if _, _, err := l.AppendBatch(recs...); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	// Corrupt record #2 payload.
+	off2, err := l.DataOffset(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flip first byte of payload #2.
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], off2); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b[:], off2); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	it, err := l.Iter(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = it.NextInto(nil)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("want ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+// NextInto: ulen mismatch after decode should return io.ErrUnexpectedEOF.
+func TestIter_NextInto_Snappy_UlenMismatch(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	data := bytes.Repeat([]byte{0xAB}, 8192) // 8 KiB
+	if _, err := l.Append(data); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	off, err := l.DataOffset(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read header for rec #1 and bump uncompressedLen.
+	hdr := make([]byte, recordHdrSize)
+	if _, err := f.ReadAt(hdr, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	ulen := binary.LittleEndian.Uint32(hdr[12:16])
+	binary.LittleEndian.PutUint32(hdr[12:16], ulen+7)
+	if _, err := f.WriteAt(hdr, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = it.NextInto(make([]byte, 0, len(data)+64)) // big enough to allow reuse path
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("want ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+// NextInto: header read error (truncate file between iterations).
+func TestIter_NextInto_HeaderReadErrorAfterTruncate(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none", retain: true, checkptK: 1})
+	defer l.Close()
+
+	// Two small records.
+	if _, _, err := l.AppendBatch([]byte("a"), []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	// Start iterator at record 2, then truncate file so second header is gone.
+	it, err := l.Iter(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compute size up to end of first record so header #2 is removed.
+	off2, err := l.DataOffset(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The second header is at (off2 - recordHdrSize). Truncate just before it.
+	if err := os.Truncate(p, off2-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now NextInto should fail on header read (not EOF).
+	_, _, err = it.NextInto(nil)
+	if err == nil {
+		t.Fatalf("expected error after truncation")
+	}
+}
+
+// NextInto: payload ReadAt() error (truncate between header and payload).
+func TestIter_NextInto_PayloadReadError(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	if _, err := l.Append(bytes.Repeat([]byte{3}, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	off, err := l.DataOffset(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read storedLen from header, then truncate to cut payload short.
+	var hdr [recordHdrSize]byte
+	if _, err := l.ReadAt(hdr[:], off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	storedLen := int64(binary.LittleEndian.Uint64(hdr[0:8]))
+	// Truncate to leave less than storedLen available.
+	if err := os.Truncate(p, off+(storedLen/2)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = it.NextInto(nil)
+	if err == nil {
+		t.Fatalf("expected payload read error after truncation")
+	}
+}
+
+// NextInto (snappy): force Decode error in the "reuse" branch (ulen>0 && cap(dst)>=ulen).
+func TestIter_NextInto_Snappy_DecodeError_Reuse(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	payload := bytes.Repeat([]byte{0x7A}, 8<<10) // 8 KiB
+	if _, err := l.Append(payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	off, err := l.DataOffset(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read header + payload, corrupt payload but update CRC to bypass CRC check.
+	f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := make([]byte, recordHdrSize)
+	if _, err := f.ReadAt(h, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	storedLen := int(binary.LittleEndian.Uint64(h[0:8]))
+
+	tmp := make([]byte, storedLen)
+	if _, err := f.ReadAt(tmp, off); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the compressed bytes so snappy.Decode will fail:
+	for i := 0; i < min(16, len(tmp)); i++ {
+		tmp[i] ^= 0xFF
+	}
+	// Rewrite payload and CRC to match corrupted bytes.
+	if _, err := f.WriteAt(tmp, off); err != nil {
+		t.Fatal(err)
+	}
+	crc := crc32.ChecksumIEEE(tmp)
+	binary.LittleEndian.PutUint32(h[8:12], crc)
+	if _, err := f.WriteAt(h, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// dst large enough → reuse path
+	dst := make([]byte, 0, int(binary.LittleEndian.Uint32(h[12:16]))+64)
+	_, _, err = it.NextInto(dst[:0])
+	if err == nil {
+		t.Fatalf("expected snappy decode error (reuse path)")
+	}
+}
+
+// NextInto (snappy): force Decode error in the "non-reuse" branch (dst too small).
+func TestIter_NextInto_Snappy_DecodeError_NonReuse(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	payload := bytes.Repeat([]byte{0x4D}, 4<<10) // 4 KiB
+	if _, err := l.Append(payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	off, err := l.DataOffset(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := make([]byte, recordHdrSize)
+	if _, err := f.ReadAt(h, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	storedLen := int(binary.LittleEndian.Uint64(h[0:8]))
+
+	tmp := make([]byte, storedLen)
+	if _, err := f.ReadAt(tmp, off); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt compressed payload differently (to avoid chance of still valid stream).
+	for i := range tmp {
+		if i%7 == 0 {
+			tmp[i] ^= 0xAA
+		}
+	}
+	if _, err := f.WriteAt(tmp, off); err != nil {
+		t.Fatal(err)
+	}
+	crc := crc32.ChecksumIEEE(tmp)
+	binary.LittleEndian.PutUint32(h[8:12], crc)
+	if _, err := f.WriteAt(h, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// dst too small → non-reuse path
+	dst := make([]byte, 0, 8)
+	_, _, err = it.NextInto(dst[:0])
+	if err == nil {
+		t.Fatalf("expected snappy decode error (non-reuse path)")
+	}
+}
+
+// small helper
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func TestIter_NextInto_IdxZeroGuard(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none"})
+	defer l.Close()
+
+	if _, err := l.Append([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force the idx==0 branch (not normally reachable) to cover the guard.
+	it.idx = 0
+	if _, _, err := it.NextInto(nil); !errors.Is(err, io.EOF) {
+		t.Fatalf("want io.EOF when idx==0, got %v", err)
+	}
+}
+
+func TestIter_NextInto_UnknownCodec_DefaultBranch(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy"}) // any; we'll override codec
+	defer l.Close()
+
+	// Write one record so iterator can read a header/payload.
+	if _, err := l.Append([]byte("zzz")); err != nil {
+		t.Fatal(err)
+	}
+
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hit the switch default by forcing an unknown codec.
+	l.compCodec = 0x7F
+	if _, _, err := it.NextInto(nil); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("want ErrUnexpectedEOF for unknown codec, got %v", err)
+	}
+}
+
+func TestIter_NextInto_PayloadReadErrorAfterTruncate(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none", retain: true, checkptK: 1})
+	defer l.Close()
+
+	// Two records so we can iterate into #2
+	if _, _, err := l.AppendBatch([]byte("aaaa"), []byte("bbbbbbbb")); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	// Iterator starting at second record (header exists)
+	it, err := l.Iter(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Truncate after header #2 but before full payload → payload ReadAt should fail
+	off2, err := l.DataOffset(2) // start of payload #2
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep just a few bytes of payload so storedLen read will fail
+	if err := os.Truncate(p, off2+1); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = it.NextInto(nil)
+	if err == nil {
+		t.Fatalf("expected payload read error, got nil")
+	}
+}
+
+func TestIter_NextInto_Snappy_DecodeError(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 1})
+	defer l.Close()
+
+	// Write a valid snappy-compressed record
+	data := bytes.Repeat([]byte{0x42}, 8<<10)
+	if _, err := l.Append(data); err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Sync()
+
+	// Corrupt the compressed payload BUT update header CRC so CRC still passes.
+	off, err := l.DataOffset(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Read header to get stored len
+	hdr := make([]byte, recordHdrSize)
+	if _, err := f.ReadAt(hdr, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+	storedLen := int64(binary.LittleEndian.Uint64(hdr[0:8]))
+
+	// Read compressed payload, corrupt it minimally to break snappy stream
+	comp := make([]byte, storedLen)
+	if _, err := f.ReadAt(comp, off); err != nil {
+		t.Fatal(err)
+	}
+	comp[0] ^= 0xFF // mutate first byte → invalid stream
+
+	// Write back corrupted payload
+	if _, err := f.WriteAt(comp, off); err != nil {
+		t.Fatal(err)
+	}
+	// Recompute CRC over stored bytes and update header
+	binary.LittleEndian.PutUint32(hdr[8:12], crc32.ChecksumIEEE(comp))
+	if _, err := f.WriteAt(hdr, off-int64(recordHdrSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now iterate and force snappy.Decode error path
+	it, err := l.Iter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := it.NextInto(nil); err == nil {
+		t.Fatalf("expected snappy decode error, got nil")
+	}
+}
+
+func TestIter_FromZero_AliasesToOne(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{comp: "none"})
+	defer l.Close()
+
+	in := [][]byte{[]byte("x"), []byte("yy")}
+	if _, _, err := l.AppendBatch(in...); err != nil {
+		t.Fatal(err)
+	}
+
+	it0, err := l.Iter(0) // should alias to from=1
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := [][]byte{}
+	for {
+		b, _, err := it0.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, b)
+	}
+	if len(got) != len(in) || !bytes.Equal(got[0], in[0]) || !bytes.Equal(got[1], in[1]) {
+		t.Fatalf("Iter(0) mismatch")
+	}
+}
+
+func TestAppendBatch_SparseIndex_CrossBatchBoundaries(t *testing.T) {
+	p := tmpPath(t)
+	l := mustOpen(t, p, openOpt{
+		comp:     "snappy",
+		retain:   true,
+		checkptK: 4,     // sparse checkpoints at 1,5,9,13,...
+		noSync:   false, // also hits the fsync path inside appendBatch
+	})
+	defer l.Close()
+
+	// First batch: 7 recs (boundaries hit at 1 and 5; ends at 7 → triggers i+1<... and the final-element else branch)
+	var b1 [][]byte
+	for i := 0; i < 7; i++ {
+		b1 = append(b1, bytes.Repeat([]byte{byte(0xA0 + i)}, 100+i))
+	}
+	first1, last1, err := l.AppendBatch(b1...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first1 != 1 || last1 != 7 {
+		t.Fatalf("range1 got [%d,%d] want [1,7]", first1, last1)
+	}
+
+	// Second batch: 6 recs (7+6=13 → crosses checkpoints at 9 and 13; also ends exactly on a checkpoint)
+	var b2 [][]byte
+	for i := 0; i < 6; i++ {
+		b2 = append(b2, bytes.Repeat([]byte{byte(0xB0 + i)}, 120+i))
+	}
+	first2, last2, err := l.AppendBatch(b2...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first2 != 8 || last2 != 13 {
+		t.Fatalf("range2 got [%d,%d] want [8,13]", first2, last2)
+	}
+
+	// Verify a handful of indices around sparse checkpoints: 1,4,5,8,9,12,13
+	check := map[int][]byte{
+		1:  b1[0],
+		4:  b1[3],
+		5:  b1[4], // checkpoint
+		8:  b2[0],
+		9:  b2[1], // checkpoint
+		12: b2[4],
+		13: b2[5], // checkpoint & final element branch in first batch already exercised
+	}
+	for i, exp := range check {
+		got, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, exp) {
+			t.Fatalf("rec %d mismatch", i)
+		}
+	}
+}
+
+func TestAppendBatch_SparseIndex_LongBatchOffsetWalk(t *testing.T) {
+	p := tmpPath(t)
+	// k=5 → checkpoints at 1,6,11,16,...
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 5})
+	defer l.Close()
+
+	// One big batch: 12 recs. We will cross checkpoints 1,6,11 inside *this* batch.
+	var recs [][]byte
+	for i := 0; i < 12; i++ {
+		recs = append(recs, bytes.Repeat([]byte{byte(0x30 + i)}, 64+i))
+	}
+	first, last, err := l.AppendBatch(recs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 || last != 12 {
+		t.Fatalf("range got [%d,%d] want [1,12]", first, last)
+	}
+
+	// Verify around checkpoint edges to ensure index math stayed consistent.
+	for _, i := range []int{1, 2, 5, 6, 10, 11, 12} {
+		got, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, recs[i-1]) {
+			t.Fatalf("rec %d mismatch", i)
+		}
+	}
+}
+
+func TestAppendBatch_SparseIndex_StartNotAligned_MultiBoundary(t *testing.T) {
+	p := tmpPath(t)
+	// k=4 → checkpoints at 1,5,9,13,...
+	l := mustOpen(t, p, openOpt{comp: "snappy", retain: true, checkptK: 4})
+	defer l.Close()
+
+	// Seed 3 records so old=3 (not aligned; next records start at index 4).
+	for i := 0; i < 3; i++ {
+		if _, err := l.Append([]byte{byte('A' + i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if l.LastIndex() != 3 {
+		t.Fatalf("seed LastIndex=%d want 3", l.LastIndex())
+	}
+
+	// Now append a batch of 12; indices 4..15 → will cross checkpoints at 5,9,13.
+	var recs [][]byte
+	for i := 0; i < 12; i++ {
+		recs = append(recs, bytes.Repeat([]byte{byte(0x60 + i)}, 80+i))
+	}
+	first, last, err := l.AppendBatch(recs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 4 || last != 15 {
+		t.Fatalf("range got [%d,%d] want [4,15]", first, last)
+	}
+
+	// Verify a spread around the boundaries 5,9,13 plus edges.
+	check := map[int][]byte{
+		4:  recs[0],
+		5:  recs[1], // checkpoint
+		8:  recs[4],
+		9:  recs[5], // checkpoint
+		12: recs[8],
+		13: recs[9], // checkpoint
+		15: recs[11],
+	}
+	for i, exp := range check {
+		got, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, exp) {
+			t.Fatalf("rec %d mismatch", i)
+		}
+	}
+}
+
+// Covers: Open with nil opts (defaults) and default comp=none path.
+func TestOpen_WithNilOptions_Defaults(t *testing.T) {
+	p := tmpPath(t)
+
+	// Pass nil opts -> Open should default BufferSize, NoSync=false, comp=None, etc.
+	l, err := Open(p, nil)
+	if err != nil {
+		t.Fatalf("Open(nil): %v", err)
+	}
+	defer l.Close()
+
+	// Append/read smoke just to ensure the default codec works.
+	in := []byte("nil-opts")
+	if _, err := l.Append(in); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	out, err := l.Read(1)
+	if err != nil {
+		t.Fatalf("Read(1): %v", err)
+	}
+	if !bytes.Equal(in, out) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
+// Covers: scanAndRecover branch when file size < dataBase (walHdrSize).
+// We instantiate a *Log manually (legal in same package) to call scanAndRecover directly.
+func TestScanAndRecover_SizeLessThanHeader(t *testing.T) {
+	p := tmpPath(t)
+	// Create a tiny file (shorter than WAL header)
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, walHdrSize/2)); err != nil {
+		t.Fatal(err)
+	}
+	// Reset offset to simulate fresh open state
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	// Handcraft a Log with just the file handle; scanAndRecover should take the
+	// size<dataBase path (seek to end and return nil).
+	l := &Log{fp: f}
+	if err := l.scanAndRecover(); err != nil {
+		t.Fatalf("scanAndRecover on short file: %v", err)
+	}
+	// Should have sought to end without panicking; no index, no records.
+	if l.LastIndex() != 0 {
+		t.Fatalf("LastIndex=%d want 0", l.LastIndex())
+	}
+
+	// Tidy up
+	_ = f.Close()
+}
