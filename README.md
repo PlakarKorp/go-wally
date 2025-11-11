@@ -1,9 +1,10 @@
 # wally — tiny, fast, append-only journal for Go
 
-`wally` is a minimal append-only write-ahead log / journal with **zero-copy headers**, **optional in-memory indexing**, **crash-safe tail recovery**, and **batched writes**. It’s designed to be **small, simple, fast, and reliable** with as few allocations as possible.
+`wally` is a minimal append-only write-ahead log / journal with **zero-copy headers**, **optional in-memory indexing**, **crash-safe tail recovery**, and **batched writes**.
+It’s designed to be **small, simple, fast, and reliable** with as few allocations as possible.
 
 * Append semantics with 1-based monotonic indexes
-* On-disk record layout: `[len|crc32|reserved|payload]`
+* On-disk record layout: `[len|crc32|ulen|reserved|payload]`
 * Optional **full index** (O(1) random reads) or **sparse checkpoints** (tiny RAM)
 * **Scan mode** (no index) for minimal memory usage
 * **Batched appends** with single flush/fsync
@@ -75,7 +76,7 @@ _ = l.Close() // Close calls Sync under the hood
 
 * **Sparse checkpoints** (`RetainIndex=true`, `CheckpointInterval=K>1`)
   Keep every K-th **header** offset. Memory ≈ `8 × ceil(N/K)` bytes.
-  With K=4096 and N=10M → ~19 KB (!). Random read scans ≤K−1 headers (≤~64 KiB).
+  With K=4096 and N=10M → \~19 KB (!). Random read scans ≤K−1 headers (≤\~64 KiB).
 
 * **Scan mode** (`RetainIndex=false`)
   Minimal RAM, but random `Read(i)` scans from BOF (O(i)). Great for streaming/iteration.
@@ -89,8 +90,9 @@ Little-endian:
 ```
 [0..7]   uint64 length
 [8..11]  uint32 CRC32 (IEEE) of payload
-[12..15] uint32 reserved (0)
-[16..]   payload bytes
+[12..15] uint64 uncompressed length
+[16..19] uint32 reserved (0)
+[20..]   payload bytes
 ```
 
 On open, `wally` scans the file, verifies CRCs, and **truncates** any torn tail at the first invalid record.
