@@ -1,4 +1,4 @@
-package jwal
+package wally
 
 import (
 	"bufio"

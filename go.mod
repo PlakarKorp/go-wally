@@ -1,4 +1,4 @@
-module github.com/PlakarKorp/go-jwal
+module github.com/PlakarKorp/go-wally
 
 go 1.25.0
 

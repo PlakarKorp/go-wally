@@ -13,12 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/PlakarKorp/go-jwal"
+	"github.com/PlakarKorp/go-wally"
 )
 
 func main() {
 	var (
-		path        = flag.String("path", "demo.wal", "output jwal path")
+		path        = flag.String("path", "demo.wal", "output wally path")
 		records     = flag.Int("records", 10_000_000, "number of records to write")
 		recSize     = flag.Int("size", 1024, "record payload size in bytes")
 		batchSize   = flag.Int("batch", 4096, "append batch size (records per batch)")
@@ -29,7 +29,7 @@ func main() {
 		pattern     = flag.String("pattern", "zero", "payload pattern: zero | seqbyte (seqbyte requires -writers=1)")
 		verifyAll   = flag.Bool("verify_all", false, "verify all records after writing (can be slow)")
 		verifyN     = flag.Int("verify_samples", 1000, "number of evenly-spaced samples to verify if -verify_all=false")
-		compression = flag.String("compression", "snappy", "jwal compression: none | snappy")
+		compression = flag.String("compression", "snappy", "wally compression: none | snappy")
 
 		// NEW:
 		writers = flag.Int("writers", 1, "number of parallel writer goroutines")
@@ -50,7 +50,7 @@ func main() {
 		*queue = 2 * *writers
 	}
 
-	opts := &jwal.Options{
+	opts := &wally.Options{
 		NoSync:             *noSync,
 		BufferSize:         256 << 10,
 		RetainIndex:        *retain,
@@ -58,7 +58,7 @@ func main() {
 		Compression:        *compression,
 	}
 
-	l, err := jwal.Open(*path, opts)
+	l, err := wally.Open(*path, opts)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func main() {
 	if err := l.Close(); err != nil {
 		log.Fatalf("close before reopen: %v", err)
 	}
-	l2, err := jwal.Open(*path, &jwal.Options{
+	l2, err := wally.Open(*path, &wally.Options{
 		NoSync:             true,
 		BufferSize:         256 << 10,
 		RetainIndex:        true,
@@ -136,7 +136,7 @@ func main() {
 // --------------------------------- helpers -----------------------------------
 
 func runSingleThread(
-	l *jwal.Log,
+	l *wally.Log,
 	path string,
 	records, recSize, batchSize int,
 	noSync bool,
@@ -205,7 +205,7 @@ type job struct {
 }
 
 func runParallel(
-	l *jwal.Log,
+	l *wally.Log,
 	path string,
 	records, recSize, batchSize, writers, qDepth int,
 	noSync bool,
@@ -320,7 +320,7 @@ func safePatternForVerify(pattern string, writers int) string {
 
 // --- verification helpers ----------------------------------------------------
 
-func verifySamples(l *jwal.Log, total, size int, pattern string, samples int) int {
+func verifySamples(l *wally.Log, total, size int, pattern string, samples int) int {
 	if samples <= 0 {
 		samples = 1
 	}
@@ -347,7 +347,7 @@ func verifySamples(l *jwal.Log, total, size int, pattern string, samples int) in
 	return count
 }
 
-func verifyRange(l *jwal.Log, from, to uint64, size int, pattern string) int {
+func verifyRange(l *wally.Log, from, to uint64, size int, pattern string) int {
 	dst := make([]byte, 0, size)
 	for i := from; i <= to; i++ {
 		var err error

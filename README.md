@@ -1,6 +1,6 @@
-# jwal — tiny, fast, append-only journal for Go
+# wally — tiny, fast, append-only journal for Go
 
-`jwal` is a minimal append-only write-ahead log / journal with **zero-copy headers**, **optional in-memory indexing**, **crash-safe tail recovery**, and **batched writes**. It’s designed to be **small, simple, fast, and reliable** with as few allocations as possible.
+`wally` is a minimal append-only write-ahead log / journal with **zero-copy headers**, **optional in-memory indexing**, **crash-safe tail recovery**, and **batched writes**. It’s designed to be **small, simple, fast, and reliable** with as few allocations as possible.
 
 * Append semantics with 1-based monotonic indexes
 * On-disk record layout: `[len|crc32|reserved|payload]`
@@ -15,11 +15,11 @@
 ## Install
 
 ```bash
-go get github.com/PlakarKorp/go-jwal
+go get github.com/PlakarKorp/go-wally
 ```
 
 ```go
-import "github.com/PlakarKorp/go-jwal"
+import "github.com/PlakarKorp/go-wally"
 ```
 
 ---
@@ -27,7 +27,7 @@ import "github.com/PlakarKorp/go-jwal"
 ## Quick start
 
 ```go
-l, err := jwal.Open("events.jwal", &jwal.Options{
+l, err := wally.Open("events.wally", &wally.Options{
     NoSync:             true,    // don't fsync every append (call Sync/Close yourself)
     BufferSize:         256<<10, // default if <=0
     RetainIndex:        true,    // keep an index in memory
@@ -93,7 +93,7 @@ Little-endian:
 [16..]   payload bytes
 ```
 
-On open, `jwal` scans the file, verifies CRCs, and **truncates** any torn tail at the first invalid record.
+On open, `wally` scans the file, verifies CRCs, and **truncates** any torn tail at the first invalid record.
 
 ---
 
@@ -227,11 +227,11 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/PlakarKorp/go-jwal"
+	"github.com/PlakarKorp/go-wally"
 )
 
 func main() {
-	l, err := jwal.Open("demo.jwal", &jwal.Options{
+	l, err := wally.Open("demo.wally", &wally.Options{
 		NoSync:             true,
 		RetainIndex:        true,
 		CheckpointInterval: 4096,
