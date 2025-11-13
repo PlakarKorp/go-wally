@@ -142,7 +142,11 @@ func BenchmarkAppendBatch_NoSync(b *testing.B) {
 				b.ResetTimer()
 
 				for i := 0; i < b.N; i++ {
-					if _, _, err := l.AppendBatch(records...); err != nil {
+					mb := l.NewBatch()
+					for j := 0; j < len(records); j++ {
+						mb.Add(records[j])
+					}
+					if err := mb.Sync(); err != nil {
 						b.Fatalf("AppendBatch: %v", err)
 					}
 				}
@@ -180,7 +184,11 @@ func BenchmarkAppendBatch_SyncEach(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, _, err := l.AppendBatch(records...); err != nil {
+		mb := l.NewBatch()
+		for j := 0; j < len(records); j++ {
+			mb.Add(records[j])
+		}
+		if err := mb.Sync(); err != nil {
 			b.Fatalf("AppendBatch: %v", err)
 		}
 	}
@@ -589,14 +597,17 @@ func TestAppendBatch_FullIndex(t *testing.T) {
 	defer l.Close()
 
 	var recs [][]byte
+	first := l.LastIndex()
+	b := l.NewBatch()
 	for i := 0; i < 10; i++ {
 		recs = append(recs, []byte{byte(i), byte(i + 1), byte(i + 2)})
+		b.Add(recs[i])
 	}
+	if err := b.Sync(); err != nil {
+		t.Fatalf("Batch Sync: %v", err)
+	}
+	last := l.LastIndex()
 
-	first, last, err := l.AppendBatch(recs...)
-	if err != nil {
-		t.Fatalf("AppendBatch: %v", err)
-	}
 	if first != 1 || last != 10 {
 		t.Fatalf("range got [%d,%d] want [1,10]", first, last)
 	}
@@ -619,14 +630,17 @@ func TestAppendBatch_SparseIndex(t *testing.T) {
 	defer l.Close()
 
 	var recs [][]byte
+	first := l.LastIndex()
+	b := l.NewBatch()
 	for i := 0; i < 25; i++ {
 		recs = append(recs, payload(200+i))
+		b.Add(recs[i])
 	}
+	if err := b.Sync(); err != nil {
+		t.Fatalf("Batch Sync: %v", err)
+	}
+	last := l.LastIndex()
 
-	first, last, err := l.AppendBatch(recs...)
-	if err != nil {
-		t.Fatalf("AppendBatch: %v", err)
-	}
 	if first != 1 || last != 25 {
 		t.Fatalf("range got [%d,%d] want [1,25]", first, last)
 	}
@@ -907,14 +921,16 @@ func TestLargePayloads_ManyRecords(t *testing.T) {
 
 	N := 200
 	keep := make([][]byte, 0, N)
+	first := l.LastIndex()
+	mb := l.NewBatch()
 	for i := 0; i < N; i++ {
 		keep = append(keep, payload(1024+((i%5)*137)))
+		mb.Add(keep[i])
 	}
-
-	first, last, err := l.AppendBatch(keep...)
-	if err != nil {
-		t.Fatalf("AppendBatch: %v", err)
+	if err := mb.Sync(); err != nil {
+		t.Fatalf("Batch Sync: %v", err)
 	}
+	last := l.LastIndex()
 	if first != 1 || last != uint64(N) {
 		t.Fatalf("range got [%d,%d] want [1,%d]", first, last, N)
 	}
@@ -1597,7 +1613,11 @@ func TestIterator_NextInto_EndBoundary(t *testing.T) {
 	defer l.Close()
 
 	in := [][]byte{[]byte("x"), []byte("yy")}
-	if _, _, err := l.AppendBatch(in...); err != nil {
+	b := l.NewBatch()
+	for _, rec := range in {
+		b.Add(rec)
+	}
+	if err := b.Sync(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1644,10 +1664,12 @@ func TestTruncateBack_SparseIndexTrim(t *testing.T) {
 
 	// 10 records total -> checkpoints at 1 and 5 and 9 (1+4+4)
 	var recs [][]byte
+	b := l.NewBatch()
 	for i := 0; i < 10; i++ {
 		recs = append(recs, []byte{byte(i)})
+		b.Add(recs[i])
 	}
-	if _, _, err := l.AppendBatch(recs...); err != nil {
+	if err := b.Sync(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1702,7 +1724,12 @@ func prefillForReads(b *testing.B, path string, recSize, recs int, comp string, 
 		if recs-written < n {
 			n = recs - written
 		}
-		if _, _, err := l.AppendBatch(batch[:n]...); err != nil {
+		mb := l.NewBatch()
+		for i := 0; i < n; i++ {
+			mb.Add(batch[i])
+		}
+
+		if err := mb.Sync(); err != nil {
 			b.Fatalf("AppendBatch(prefill): %v", err)
 		}
 		written += n

@@ -604,9 +604,14 @@ func (l *Log) ReadAt(p []byte, off int64) (int, error) {
 	return l.fp.ReadAt(p, off)
 }
 
+func (l *Log) NewBatch() *Batch {
+	return &Batch{l: l}
+}
+
 // Batch
 
 type Batch struct {
+	l    *Log
 	recs [][]byte
 }
 
@@ -626,25 +631,14 @@ func (b *Batch) Records() [][]byte {
 	return b.recs
 }
 
-func (l *Log) AppendBatch(records ...[]byte) (first, last uint64, err error) {
-	if len(records) == 0 {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		return l.count.Load(), l.count.Load(), nil
-	}
-	return l.appendBatch(records)
-}
-
-func (l *Log) WriteBatch(b *Batch) (first, last uint64, err error) {
+func (b *Batch) Sync() error {
 	if b == nil || len(b.recs) == 0 {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		return l.count.Load(), l.count.Load(), nil
+		return nil
 	}
-	return l.appendBatch(b.recs)
+	return b.l.writeBatch(b.recs)
 }
 
-func (l *Log) appendBatch(records [][]byte) (first, last uint64, err error) {
+func (l *Log) writeBatch(records [][]byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -652,7 +646,7 @@ func (l *Log) appendBatch(records [][]byte) (first, last uint64, err error) {
 
 	hdrOff, err := l.fp.Seek(0, io.SeekEnd)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 
 	// Write all headers + payloads
@@ -668,10 +662,10 @@ func (l *Log) appendBatch(records [][]byte) (first, last uint64, err error) {
 		binary.LittleEndian.PutUint32(hdr[12:16], ulen)
 
 		if _, err := l.w.Write(hdr[:]); err != nil {
-			return 0, 0, err
+			return err
 		}
 		if _, err := l.w.Write(payload); err != nil {
-			return 0, 0, err
+			return err
 		}
 
 		// advance expected file offset for index math
@@ -680,16 +674,15 @@ func (l *Log) appendBatch(records [][]byte) (first, last uint64, err error) {
 	}
 
 	if err := l.w.Flush(); err != nil {
-		return 0, 0, err
+		return err
 	}
 	if !l.noSync {
 		if err := l.fp.Sync(); err != nil {
-			return 0, 0, err
+			return err
 		}
 	}
 
 	old := l.count.Load()
-	first = old + 1
 	nRecs := uint64(len(records))
 
 	if l.retainIndex {
@@ -720,8 +713,7 @@ func (l *Log) appendBatch(records [][]byte) (first, last uint64, err error) {
 	}
 
 	l.count.Add(nRecs)
-	last = l.count.Load()
-	return first, last, nil
+	return nil
 }
 
 // iter
