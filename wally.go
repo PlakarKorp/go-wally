@@ -84,7 +84,7 @@ type Log struct {
 	count atomic.Uint64
 
 	// scratch buffers (used under mu)
-	compScratch []byte
+	//compScratch []byte
 }
 
 func (l *Log) writeFileHeaderLocked() error {
@@ -137,7 +137,6 @@ func Open(path string, opts *Options) (*Log, error) {
 	case "snappy":
 		compCodec = compSnappy
 	default:
-		fmt.Println("unknown compression codec:", opts.Compression)
 		return nil, io.ErrUnexpectedEOF
 	}
 
@@ -270,18 +269,19 @@ func (l *Log) scanAndRecover() error {
 }
 
 func (l *Log) write(data []byte, sync bool) (uint64, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+
+	// Prepare payload (maybe compressed)
+	payload, storedLen, ulen := l.preparePayload(data)
 
 	var hdr [recordHdrSize]byte
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	hdrOff, err := l.fp.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, err
 	}
-
-	// Prepare payload (maybe compressed)
-	payload, storedLen, ulen := l.preparePayloadLocked(data)
 
 	// Write header
 	binary.LittleEndian.PutUint64(hdr[0:8], storedLen)
@@ -326,13 +326,14 @@ func (l *Log) WriteNoSync(data []byte) (uint64, error) {
 	return l.write(data, false)
 }
 
-func (l *Log) preparePayloadLocked(data []byte) (payload []byte, storedLen uint64, ulen uint32) {
+func (l *Log) preparePayload(data []byte) (payload []byte, storedLen uint64, ulen uint32) {
+	var compScratch []byte
 	switch l.compCodec {
 	case compNone:
 		return data, uint64(len(data)), 0
 	case compSnappy:
-		l.compScratch = snappy.Encode(l.compScratch[:0], data)
-		return l.compScratch, uint64(len(l.compScratch)), uint32(len(data))
+		compScratch = snappy.Encode(compScratch[:0], data)
+		return compScratch, uint64(len(compScratch)), uint32(len(data))
 	default:
 		return data, uint64(len(data)), 0
 	}
@@ -654,7 +655,7 @@ func (l *Log) writeBatch(records [][]byte) error {
 	off := hdrOff
 
 	for _, p := range records {
-		payload, storedLen, ulen := l.preparePayloadLocked(p)
+		payload, storedLen, ulen := l.preparePayload(p)
 
 		// header
 		binary.LittleEndian.PutUint64(hdr[0:8], storedLen)
