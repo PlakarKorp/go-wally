@@ -184,8 +184,12 @@ func runSingleThread(
 			}
 		}
 
-		if _, _, err := l.AppendBatch(b[:n]...); err != nil {
-			log.Fatalf("AppendBatch: %v", err)
+		mb := l.NewBatch()
+		for i := 0; i < n; i++ {
+			mb.Add(b[i])
+		}
+		if err := mb.Sync(); err != nil {
+			log.Fatalf("Sync: %v", err)
 		}
 		written += n
 
@@ -242,8 +246,13 @@ func runParallel(
 				for i := 0; i < n; i++ {
 					b[i] = zeroPayload
 				}
-				if _, _, err := l.AppendBatch(b[:n]...); err != nil {
-					log.Fatalf("[worker %d] AppendBatch: %v", wid, err)
+
+				mb := l.NewBatch()
+				for i := 0; i < n; i++ {
+					mb.Add(b[i])
+				}
+				if err := mb.Sync(); err != nil {
+					log.Fatalf("[worker %d] Sync: %v", wid, err)
 				}
 				newWritten := written.Add(int64(n))
 
